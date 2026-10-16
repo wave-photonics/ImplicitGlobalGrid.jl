@@ -16,6 +16,29 @@ ImplicitGlobalGrid.gpurecvbuf(n::Integer, dim::Integer, i::Integer, A::ROCField{
 ImplicitGlobalGrid.gpusendbuf_flat(n::Integer, dim::Integer, i::Integer, A::ROCField{T}) where {T <: GGNumber} = gpusendbuf_flat(n,dim,i,A)
 ImplicitGlobalGrid.gpurecvbuf_flat(n::Integer, dim::Integer, i::Integer, A::ROCField{T}) where {T <: GGNumber} = gpurecvbuf_flat(n,dim,i,A)
 
+# Device buffers handed to a GPU-aware MPI are allocated with plain hipMalloc rather than from
+# AMDGPU.jl's memory pool (hipMallocFromPoolAsync): the HSA runtime reports pool memory as
+# HSA_EXT_POINTER_TYPE_HSA_VMEM, which UCX (1.22) neither classifies as device memory nor can
+# export for IPC (openucx/ucx#11898), so an exchange of pool memory fails. The buffers are
+# wrapped as ROCArrays (not owned) and freed with hipFree; the set holds their pointers.
+const rocbufs_plain = Set{Ptr{Cvoid}}()
+function alloc_rocbuf(T::DataType, nelems::Integer)
+    ptr = Ref{Ptr{Cvoid}}()
+    AMDGPU.HIP.hipMalloc(ptr, nelems*sizeof(T))
+    A = unsafe_wrap(ROCArray, Ptr{T}(ptr[]), nelems; own=false)
+    fill!(A, zero(T))
+    push!(rocbufs_plain, ptr[])
+    return A
+end
+function free_rocbuf(A)
+    ptr = Ptr{Cvoid}(pointer(A))
+    if (ptr in rocbufs_plain)
+        delete!(rocbufs_plain, ptr); AMDGPU.HIP.hipFree(ptr);
+    else
+        AMDGPU.unsafe_free!(A);
+    end
+end
+
 let
     global free_update_halo_rocbuffers, init_rocbufs_arrays, init_rocbufs, reinterpret_rocbufs, reregister_rocbufs, reallocate_undersized_rocbufs
     global gpusendbuf, gpurecvbuf, gpusendbuf_flat, gpurecvbuf_flat
@@ -34,7 +57,7 @@ let
         if (bufs !== nothing)
             for i = 1:length(bufs)
                 for n = 1:length(bufs[i])
-                    if is_rocarray(bufs[i][n]) AMDGPU.unsafe_free!(bufs[i][n]); bufs[i][n] = []; end # DEBUG: unsafe_free should be managed in AMDGPU
+                    if is_rocarray(bufs[i][n]) free_rocbuf(bufs[i][n]); bufs[i][n] = []; end # DEBUG: unsafe_free should be managed in AMDGPU
                 end
             end
         end
@@ -79,8 +102,9 @@ let
     end
 
     function reallocate_rocbufs(T::DataType, i::Integer, n::Integer, max_halo_elems::Integer)
-        rocsendbufs_raw[i][n] = AMDGPU.zeros(T, Int(ceil(max_halo_elems/GG_ALLOC_GRANULARITY))*GG_ALLOC_GRANULARITY); # Ensure that the amount of allocated memory is a multiple of 4*sizeof(T) (sizeof(Float64)/sizeof(Float16) = 4). So, we can always correctly reinterpret the raw buffers even if next time sizeof(T) is greater.
-        rocrecvbufs_raw[i][n] = AMDGPU.zeros(T, Int(ceil(max_halo_elems/GG_ALLOC_GRANULARITY))*GG_ALLOC_GRANULARITY);
+        nelems = Int(ceil(max_halo_elems/GG_ALLOC_GRANULARITY))*GG_ALLOC_GRANULARITY; # Ensure that the amount of allocated memory is a multiple of 4*sizeof(T) (sizeof(Float64)/sizeof(Float16) = 4). So, we can always correctly reinterpret the raw buffers even if next time sizeof(T) is greater.
+        rocsendbufs_raw[i][n] = alloc_rocbuf(T, nelems);
+        rocrecvbufs_raw[i][n] = alloc_rocbuf(T, nelems);
     end
 
     function reregister_rocbufs(T::DataType, i::Integer, n::Integer, sendbufs_raw, recvbufs_raw)
