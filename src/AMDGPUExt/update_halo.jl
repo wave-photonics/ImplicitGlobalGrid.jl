@@ -147,6 +147,28 @@ end
 ##----------------------------------------------
 ## FUNCTIONS TO WRITE AND READ SEND/RECV BUFFERS
 
+# AMDGPU.jl (2.8 and later) takes ownership of every array argument for the stream a kernel
+# is launched on and, when the array was last used on another stream that still has work in
+# flight, synchronises that stream first, through its non-blocking path (several ms here).
+# The halo pack and unpack run on streams of their own while the caller's kernels run on
+# others, by design, so the arrays are claimed for the stream beforehand: the caller orders
+# the streams itself (it waits for its kernels before the exchange reads their cells).
+function claim_for_rocstream!(stream, A::ROCArray)
+    isdefined(AMDGPU, :take_ownership_fast!) || return nothing
+    m = A.buf[]
+    if hasfield(typeof(m), :lock)
+        Base.@lock m.lock begin
+            m.stream = stream
+            m.dirty = true
+        end
+    else
+        m.stream = stream
+        m.dirty = true
+    end
+    return nothing
+end
+claim_for_rocstream!(stream, A) = nothing
+
 function ImplicitGlobalGrid.allocate_rocstreams(fields::GGField...)
     allocate_rocstreams_iwrite(fields...);
     allocate_rocstreams_iread(fields...);
@@ -179,6 +201,8 @@ let
                 nthreads = (dim==1) ? (1, 32, 1) : (32, 1, 1);
                 halosize = [r[end] - r[1] + 1 for r in ranges];
                 nblocks  = Tuple(ceil.(Int, halosize./nthreads));
+                claim_for_rocstream!(rocstreams[n,i], A)
+                claim_for_rocstream!(rocstreams[n,i], gpusendbuf(n,dim,i,F))
                 @roc gridsize=nblocks groupsize=nthreads stream=rocstreams[n,i] write_d2x!(gpusendbuf(n,dim,i,F), A, ranges[1], ranges[2], ranges[3], dim);
             else
                 write_d2h_async!(sendbuf_flat(n,dim,i,F), A, sendranges(n,dim,F), rocstreams[n,i]);
@@ -209,6 +233,8 @@ let
                 nthreads = (dim==1) ? (1, 32, 1) : (32, 1, 1);
                 halosize = [r[end] - r[1] + 1 for r in ranges];
                 nblocks  = Tuple(ceil.(Int, halosize./nthreads));
+                claim_for_rocstream!(rocstreams[n,i], A)
+                claim_for_rocstream!(rocstreams[n,i], gpurecvbuf(n,dim,i,F))
                 @roc gridsize=nblocks groupsize=nthreads stream=rocstreams[n,i] read_x2d!(gpurecvbuf(n,dim,i,F), A, ranges[1], ranges[2], ranges[3], dim);
             else
                 read_h2d_async!(recvbuf_flat(n,dim,i,F), A, recvranges(n,dim,F), rocstreams[n,i]);
